@@ -9,8 +9,9 @@ import com.ardwiinoo.csvappfuture.services.CountryService;
 import com.ardwiinoo.csvappfuture.utils.FileUtil;
 import com.opencsv.CSVReader;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.io.InputStreamReader;
 import java.util.ArrayList;
@@ -23,6 +24,10 @@ public class CountryServiceImpl implements CountryService {
 
     @Autowired
     private CountryRepository countryRepository;
+
+    @Autowired
+    @Qualifier("taskExecutor")
+    private ThreadPoolTaskExecutor executor;
 
     @Override
     public CompletableFuture<List<CountryDto>> upload(CountryRequest request) {
@@ -49,37 +54,35 @@ public class CountryServiceImpl implements CountryService {
                 throw new RuntimeException("CSV Error: " + e.getMessage(), e);
             }
             return countries;
-        });
+        }, executor);
 
-        // 2. Save ke DB Async dengan Batch
+        // 2. Save to DB Async with Batch
         return readCsvFuture.thenCompose(countries -> {
             if (countries.isEmpty()) {
                 throw new RuntimeException("CSV Kosong!");
             }
+
             System.out.println("INSERTING TO DB...");
 
-            return CompletableFuture.supplyAsync(() -> batchInsert(countries));
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            int batchSize = Integer.parseInt(System.getProperty("spring.jpa.properties.hibernate.jdbc.batch_size", "1000"));
+
+            for (int i = 0; i < countries.size(); i += batchSize) {
+                final int index = i;
+                List<Country> batch = countries.subList(index, Math.min(index + batchSize, countries.size()));
+                futures.add(CompletableFuture.runAsync(() -> {
+                    countryRepository.saveAll(batch);
+                    System.out.println("Batch " + (index / batchSize + 1) + " inserted");
+                }, executor));
+            }
+
+            return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                    .thenApply(v -> countries.stream()
+                            .map(CountryMapper.INSTANCE::toDto)
+                            .collect(Collectors.toList()));
         }).exceptionally(ex -> {
             throw new RuntimeException("Gagal: " + ex.getMessage(), ex);
         });
-    }
-
-    @Transactional
-    public List<CountryDto> batchInsert(List<Country> countries) {
-        int batchSize = 1000;
-        List<CountryDto> result = new ArrayList<>();
-
-        for (int i = 0; i < countries.size(); i += batchSize) {
-            List<Country> batch = countries.subList(i, Math.min(i + batchSize, countries.size()));
-            countryRepository.saveAll(batch);
-
-            result.addAll(batch.stream()
-                    .map(CountryMapper.INSTANCE::toDto)
-                    .collect(Collectors.toList()));
-
-            System.out.println("Batch " + (i / batchSize + 1) + " inserted");
-        }
-        return result;
     }
 }
 
